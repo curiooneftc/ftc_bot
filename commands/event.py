@@ -14,33 +14,38 @@ query EventByCode($season: Int!, $code: String!) {
     fieldCount
     ongoing
     started
-    matches {
-      matchNum
-      teams {
-        alliance
-        teamNumber
-        team {
-          name
+    teams {
+      teamNumber
+      stats {
+        ... on TeamEventStats2025 {
+          rank
+          avg {
+            totalPoints
+            totalPointsNp
+          }
+          rp
+          wins
+          losses
         }
       }
-      scheduledStartTime
-      postResultTime
-      scores {
-        ... on MatchScores2025 {
-          red {
-            totalPoints
-            totalPointsNp
-          }
-          blue {
-            totalPoints
-            totalPointsNp
-          }
-        }
+      team {
+        name
       }
     }
   }
 }
 """
+
+def assign_places(rows, value_key):
+    place = 0
+    last_value = None
+    for i, row in enumerate(rows):
+        value = row[value_key]
+        if value != last_value:
+            place = i + 1
+            last_value = value
+        row["place"] = place
+
 
 class EventCommand(app_commands.Command):
     def __init__(self):
@@ -56,6 +61,8 @@ class EventCommand(app_commands.Command):
         event_code: str,
         season: int | None = None,
         advanced: bool | None = False,
+        rank_by_points: bool | None = False,
+        rank_by_points_np: bool | None = False
     ):
         await interaction.response.defer()
 
@@ -108,6 +115,18 @@ class EventCommand(app_commands.Command):
             if event.get("liveStreamUrl"):
                 message += f"Livestream: {event['liveStreamUrl']}\n"
 
+            if rank_by_points and not advanced:
+                await interaction.followup.send(
+                    "You can only see this data with advanced."
+                )
+                return
+
+            if rank_by_points_np and not advanced:
+                await interaction.followup.send(
+                    "You can only see this data with advanced."
+                )
+                return
+
             if advanced:
                 variables = {
                     "season": season,
@@ -144,38 +163,77 @@ class EventCommand(app_commands.Command):
                     f"Fields: {scout_event['fieldCount']}\n"
                 )
 
-                matches = scout_event.get("matches", [])
+                teams = scout_event.get("teams", [])
 
-                if not matches:
-                    message += "\nNo match data available yet."
+                if not teams:
+                    message += "\nNo team ranking data available yet."
                 else:
-                    message += "\n**Matches**\n"
+                    team_rows = []
 
-                    for m in matches:
-                        scores = m.get("scores")
-                        teams = m.get("teams", [])
+                    for t in teams:
+                        stats = t.get("stats") or {}
+                        team_self = t.get("team") or {}
 
-                        red_teams = []
-                        blue_teams = []
+                        rank = stats.get("rank")
+                        avg = stats.get("avg", {}).get("totalPoints")
+                        avgNp = stats.get("avg", {}).get("totalPointsNp")
+                        wins = stats.get("wins")
+                        losses = stats.get("losses")
+                        name = team_self.get("name")
 
-                        for team in teams:
-                            alliance = team.get("alliance", "").lower()
-                            team_number = team.get("teamNumber")
+                        if avg is None and rank is None:
+                            continue
 
-                            label = f"{team_number}"
+                        team_rows.append({
+                            "team": t["teamNumber"],
+                            "name": name,
+                            "rank": rank,
+                            "avg": round(avg, 1) if avg is not None else "—",
+                            "avgNp": round(avgNp, 1) if avg is not None else "—",
+                            "wins": wins if wins is not None else "—",
+                            "losses": losses if losses is not None else "—",
+                            "_avg_raw": avg,
+                            "_avg_rawNp": avgNp,
+                        })
 
-                            if alliance == "red":
-                                red_teams.append(label)
-                            elif alliance == "blue":
-                                blue_teams.append(label)
+                    if rank_by_points and rank_by_points_np:
+                        await interaction.followup.send(
+                            "Choose only one: rank_by_points OR rank_by_points_np."
+                        )
+                        return
 
-                        red_score = scores["red"]["totalPoints"] if scores else "—"
-                        blue_score = scores["blue"]["totalPoints"] if scores else "—"
+
+                    if rank_by_points:
+                        team_rows.sort(
+                            key=lambda x: (x["_avg_raw"] is None, -(x["_avg_raw"] or 0))
+                        )
+                        assign_places(team_rows, "_avg_raw")
+                        message += "\n**Team Rankings (by Avg Points)**\n"
+                        show_place = True
+
+                    elif rank_by_points_np:
+                        team_rows.sort(
+                            key=lambda x: (x["_avg_rawNp"] is None, -(x["_avg_rawNp"] or 0))
+                        )
+                        assign_places(team_rows, "_avg_rawNp")
+                        message += "\n**Team Rankings (by Avg Points Np)**\n"
+                        show_place = True
+
+                    else:
+                        team_rows.sort(
+                            key=lambda x: (x["rank"] is None, x["rank"] or 9999)
+                        )
+                        message += "\n**Team Rankings (by Official Rank)**\n"
+                        show_place = False
+
+                    for t in team_rows:
+                        pos = t["place"] if show_place else t["rank"]
 
                         message += (
-                            f"Match {m['matchNum']} — "
-                            f"Red ({', '.join(red_teams)}): {red_score} | "
-                            f"Blue ({', '.join(blue_teams)}): {blue_score}\n"
+                            f"#{pos} — Team {t['team']}, **{t['name']}** | "
+                            f"Avg: {t['avg']} | "
+                            f"NP: {t['avgNp']} | "
+                            f"W-L: {t['wins']}-{t['losses']}\n"
                         )
 
             await interaction.followup.send(message[:2000])
