@@ -1,6 +1,6 @@
 ﻿from .team import TeamCommand
-from .season import SeasonCommand
 from .event import EventCommand
+from .season import SeasonCommand
 
 all_commands = [
     TeamCommand,
