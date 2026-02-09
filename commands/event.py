@@ -1,51 +1,119 @@
 ﻿import discord
 from discord import app_commands
 import requests
+from helpers import std_vars, assign_places
+
+query = std_vars.SCOUT_QUERY
+tpp = std_vars.TEAMS_PER_PAGE
 
 from API.first import build_auth_header, get_current_season
 from conf import BASE_URL, BASE_URL_SCOUT
 
-SCOUT_QUERY = """
-query EventByCode($season: Int!, $code: String!) {
-  eventByCode(season: $season, code: $code) {
-    name
-    code
-    finished
-    fieldCount
-    ongoing
-    started
-    teams {
-      teamNumber
-      stats {
-        ... on TeamEventStats2025 {
-          rank
-          avg {
-            totalPoints
-            totalPointsNp
-          }
-          rp
-          wins
-          losses
-        }
-      }
-      team {
-        name
-      }
-    }
-  }
-}
-"""
+def build_embeds(event_name: str, teams: list[dict], sort_mode: str) -> list[discord.Embed]:
+    embeds = []
 
-def assign_places(rows, value_key):
-    place = 0
-    last_value = None
-    for i, row in enumerate(rows):
-        value = row[value_key]
-        if value != last_value:
-            place = i + 1
-            last_value = value
-        row["place"] = place
+    for page_index in range(0, len(teams), tpp):
+        chunk = teams[page_index:page_index + tpp]
 
+        embed = discord.Embed(
+            title=event_name,
+            description=f"**Team Rankings — {sort_mode}**",
+            color=discord.Color.blurple()
+        )
+
+        for t in chunk:
+            embed.add_field(
+                name=f"#{t['pos']} — Team {t['team']}",
+                value=(
+                    f"**{t['name']}**\n"
+                    f"Avg: {t['avg']} | NP: {t['avgNp']} | "
+                    f"W-L: {t['wins']}-{t['losses']}"
+                ),
+                inline=False
+            )
+
+        embed.set_footer(
+            text=f"Page {len(embeds) + 1} / {((len(teams) - 1) // tpp) + 1}"
+        )
+        embeds.append(embed)
+
+    return embeds
+
+class RankingView(discord.ui.View):
+    def __init__(self, interaction: discord.Interaction, event_name: str, teams: list[dict]):
+        super().__init__(timeout=180)
+        self.author_id = interaction.user.id
+        self.event_name = event_name
+        self.original_teams = teams
+        self.page = 0
+        self.sort_mode = "Rank"
+        self.embeds = self._rebuild()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.author_id
+
+    def _rebuild(self):
+        teams = self.original_teams.copy()
+
+        if self.sort_mode == "Rank":
+            teams.sort(key=lambda x: (x["rank"] is None, x["rank"] or 9999))
+            for t in teams:
+                t["pos"] = t["rank"]
+
+        elif self.sort_mode == "Avg":
+            teams.sort(key=lambda x: (x["_avg_raw"] is None, -(x["_avg_raw"] or 0)))
+            assign_places(teams, "_avg_raw")
+            for t in teams:
+                t["pos"] = t["place"]
+
+        elif self.sort_mode == "Avg NP":
+            teams.sort(key=lambda x: (x["_avg_rawNp"] is None, -(x["_avg_rawNp"] or 0)))
+            assign_places(teams, "_avg_rawNp")
+            for t in teams:
+                t["pos"] = t["place"]
+
+        return build_embeds(self.event_name, teams, self.sort_mode)
+
+    async def _update(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(
+            embed=self.embeds[self.page],
+            view=self
+        )
+
+    # Pagination
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def prev(self, interaction: discord.Interaction, _):
+        if self.page > 0:
+            self.page -= 1
+        await self._update(interaction)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def next(self, interaction: discord.Interaction, _):
+        if self.page < len(self.embeds) - 1:
+            self.page += 1
+        await self._update(interaction)
+
+    # Sorting
+    @discord.ui.button(label="🏆 Rank", style=discord.ButtonStyle.primary)
+    async def sort_rank(self, interaction: discord.Interaction, _):
+        self.sort_mode = "Rank"
+        self.page = 0
+        self.embeds = self._rebuild()
+        await self._update(interaction)
+
+    @discord.ui.button(label="📊 Avg", style=discord.ButtonStyle.primary)
+    async def sort_avg(self, interaction: discord.Interaction, _):
+        self.sort_mode = "Avg"
+        self.page = 0
+        self.embeds = self._rebuild()
+        await self._update(interaction)
+
+    @discord.ui.button(label="⚡ Avg NP", style=discord.ButtonStyle.primary)
+    async def sort_np(self, interaction: discord.Interaction, _):
+        self.sort_mode = "Avg NP"
+        self.page = 0
+        self.embeds = self._rebuild()
+        await self._update(interaction)
 
 class EventCommand(app_commands.Command):
     def __init__(self):
@@ -61,184 +129,73 @@ class EventCommand(app_commands.Command):
         event_code: str,
         season: int | None = None,
         advanced: bool | None = False,
-        rank_by_points: bool | None = False,
-        rank_by_points_np: bool | None = False
     ):
         await interaction.response.defer()
 
         headers = build_auth_header()
         current_season = get_current_season()
+        season = season or current_season
 
-        if season is None:
-            season = current_season
-
-        if season > current_season:
-            await interaction.followup.send("Are you from the future?")
+        r = requests.get(f"{BASE_URL}/{season}/events", headers=headers, timeout=10)
+        if r.status_code != 200:
+            await interaction.followup.send("Failed to fetch events.")
             return
 
-        try:
-            r = requests.get(
-                f"{BASE_URL}/{season}/events",
-                headers=headers,
-                timeout=10
-            )
+        event = next(
+            (e for e in r.json().get("events", [])
+             if e.get("code", "").lower() == event_code.lower()),
+            None
+        )
 
-            if r.status_code == 401:
-                await interaction.followup.send("Unauthorized – check API credentials.")
-                return
+        if not event:
+            await interaction.followup.send("Event not found.")
+            return
 
-            if r.status_code != 200:
-                await interaction.followup.send(f"FIRST API error `{r.status_code}`.")
-                return
-
-            data = r.json()
-
-            event = next(
-                (e for e in data.get("events", [])
-                 if e.get("code", "").lower() == event_code.lower()),
-                None
-            )
-
-            if not event:
-                await interaction.followup.send("Event not found.")
-                return
-
-            message = (
-                f"**{event['name']}**\n"
+        info_embed = discord.Embed(
+            title=event["name"],
+            description=(
                 f"Code: `{event['code']}`\n"
-                f"Type: {event['typeName']}\n"
-                f"{event['venue']}, {event['address']}\n"
-                f"{event['city']}, {event['stateprov']}\n"
-                f"Website: {event['website']}\n"
-            )
+                f"{event['venue']}, {event['city']} {event['stateprov']}\n"
+                f"[Website]({event['website']})"
+            ),
+            color=discord.Color.green()
+        )
 
-            if event.get("liveStreamUrl"):
-                message += f"Livestream: {event['liveStreamUrl']}\n"
+        await interaction.followup.send(embed=info_embed)
 
-            if rank_by_points and not advanced:
-                await interaction.followup.send(
-                    "You can only see this data with advanced."
-                )
-                return
+        if not advanced:
+            return
 
-            if rank_by_points_np and not advanced:
-                await interaction.followup.send(
-                    "You can only see this data with advanced."
-                )
-                return
+        response = requests.post(
+            BASE_URL_SCOUT,
+            json={"query": query, "variables": {"season": season, "code": event["code"].upper()}},
+            timeout=10
+        )
 
-            if advanced:
-                variables = {
-                    "season": season,
-                    "code": event["code"].upper()
-                }
+        scout_event = response.json().get("data", {}).get("eventByCode")
+        if not scout_event or not scout_event.get("teams"):
+            await interaction.followup.send("No team data available yet.")
+            return
 
-                response = requests.post(
-                    BASE_URL_SCOUT,
-                    json={"query": SCOUT_QUERY, "variables": variables},
-                    timeout=10
-                )
+        team_rows = []
+        for t in scout_event["teams"]:
+            stats = t.get("stats") or {}
+            team = t.get("team") or {}
 
-                scout_data = response.json()
+            avg = stats.get("avg", {}).get("totalPoints")
+            avgNp = stats.get("avg", {}).get("totalPointsNp")
 
-                if "errors" in scout_data:
-                    await interaction.followup.send(
-                        f"FTC Scout error: {scout_data['errors'][0]['message']}"
-                    )
-                    return
+            team_rows.append({
+                "team": t["teamNumber"],
+                "name": team.get("name", "Unknown"),
+                "rank": stats.get("rank"),
+                "avg": round(avg, 1) if avg is not None else "—",
+                "avgNp": round(avgNp, 1) if avgNp is not None else "—",
+                "wins": stats.get("wins", "—"),
+                "losses": stats.get("losses", "—"),
+                "_avg_raw": avg,
+                "_avg_rawNp": avgNp,
+            })
 
-                scout_event = scout_data.get("data", {}).get("eventByCode")
-
-                if not scout_event:
-                    await interaction.followup.send(
-                        "FTC Scout has no data for this event yet."
-                    )
-                    return
-
-                message += (
-                    f"\n**FTC Scout Status**\n"
-                    f"Started: {scout_event['started']}\n"
-                    f"Ongoing: {scout_event['ongoing']}\n"
-                    f"Finished: {scout_event['finished']}\n"
-                    f"Fields: {scout_event['fieldCount']}\n"
-                )
-
-                teams = scout_event.get("teams", [])
-
-                if not teams:
-                    message += "\nNo team ranking data available yet."
-                else:
-                    team_rows = []
-
-                    for t in teams:
-                        stats = t.get("stats") or {}
-                        team_self = t.get("team") or {}
-
-                        rank = stats.get("rank")
-                        avg = stats.get("avg", {}).get("totalPoints")
-                        avgNp = stats.get("avg", {}).get("totalPointsNp")
-                        wins = stats.get("wins")
-                        losses = stats.get("losses")
-                        name = team_self.get("name")
-
-                        if avg is None and rank is None:
-                            continue
-
-                        team_rows.append({
-                            "team": t["teamNumber"],
-                            "name": name,
-                            "rank": rank,
-                            "avg": round(avg, 1) if avg is not None else "—",
-                            "avgNp": round(avgNp, 1) if avg is not None else "—",
-                            "wins": wins if wins is not None else "—",
-                            "losses": losses if losses is not None else "—",
-                            "_avg_raw": avg,
-                            "_avg_rawNp": avgNp,
-                        })
-
-                    if rank_by_points and rank_by_points_np:
-                        await interaction.followup.send(
-                            "Choose only one: rank_by_points OR rank_by_points_np."
-                        )
-                        return
-
-
-                    if rank_by_points:
-                        team_rows.sort(
-                            key=lambda x: (x["_avg_raw"] is None, -(x["_avg_raw"] or 0))
-                        )
-                        assign_places(team_rows, "_avg_raw")
-                        message += "\n**Team Rankings (by Avg Points)**\n"
-                        show_place = True
-
-                    elif rank_by_points_np:
-                        team_rows.sort(
-                            key=lambda x: (x["_avg_rawNp"] is None, -(x["_avg_rawNp"] or 0))
-                        )
-                        assign_places(team_rows, "_avg_rawNp")
-                        message += "\n**Team Rankings (by Avg Points Np)**\n"
-                        show_place = True
-
-                    else:
-                        team_rows.sort(
-                            key=lambda x: (x["rank"] is None, x["rank"] or 9999)
-                        )
-                        message += "\n**Team Rankings (by Official Rank)**\n"
-                        show_place = False
-
-                    for t in team_rows:
-                        pos = t["place"] if show_place else t["rank"]
-
-                        message += (
-                            f"#{pos} — Team {t['team']}, **{t['name']}** | "
-                            f"Avg: {t['avg']} | "
-                            f"NP: {t['avgNp']} | "
-                            f"W-L: {t['wins']}-{t['losses']}\n"
-                        )
-
-            await interaction.followup.send(message[:2000])
-
-        except requests.exceptions.Timeout:
-            await interaction.followup.send("Request timed out.")
-        except Exception as e:
-            await interaction.followup.send(f"Error: {e}")
+        view = RankingView(interaction, event["name"], team_rows)
+        await interaction.followup.send(embed=view.embeds[0], view=view)
